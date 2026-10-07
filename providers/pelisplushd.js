@@ -5,6 +5,42 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const FUENTE = 'PelisPlusHD';
 const BASES = ['https://pelisplushd.bz', 'https://www.pelisplushd.la', 'https://ww3.pelisplus.to'];
 const TMDB_KEY = '439c478a771f35c05022f9feabcca01c';
+const VERSION = '1.2.0';
+const UA_MOVIL = 'Mozilla/5.0 (Linux; Android 13; moto g82 5G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36';
+
+// DEBUG: agrega al final de la lista una entrada "ESTADO DE REPRODUCTORES" (no reproducible)
+// con lo que pasó en cada paso. Poner en false cuando todo funcione.
+const DEBUG = true;
+let TRACE = [];
+let ESTADO = {};
+
+function trace(m) {
+  if (TRACE.length < 60) TRACE.push(String(m).replace(/\s+/g, ' ').slice(0, 140));
+}
+
+function anotarEstado(label, ok, audio, motivo) {
+  const e = ESTADO[label] || (ESTADO[label] = { total: 0, ok: 0, motivo: '', audios: [] });
+  e.total++;
+  if (ok) {
+    e.ok++;
+    if (audio && !e.audios.includes(audio)) e.audios.push(audio);
+  } else if (!e.motivo) {
+    e.motivo = motivo || 'sin video en el embed';
+  }
+}
+
+function entradaEstado(titulo) {
+  const lineas = Object.keys(ESTADO).map((l) => {
+    const e = ESTADO[l];
+    const a = e.audios.length ? ` [${e.audios.join('/')}]` : '';
+    if (!e.ok) return `\u274C ${l} \u2014 ${e.motivo}`;
+    if (e.ok < e.total) return `\u26A0\uFE0F ${l} \u2014 ${e.ok}/${e.total} embeds${a}`;
+    return `\u2705 ${l} \u2014 ${e.ok} ${e.ok === 1 ? 'embed' : 'embeds'}${a}`;
+  });
+  const cuerpo = ['\uD83D\uDCE1 ESTADO DE REPRODUCTORES (no reproducir)', `${FUENTE} v${VERSION}${titulo ? ` | ${titulo}` : ''}`].concat(lineas);
+  if (!lineas.length) cuerpo.push('(sin reproductores en esta consulta)');
+  return { name: FUENTE, title: '', url: `${BASES[0]}/`, quality: cuerpo.concat(['\uD83D\uDEE0 DIAGNOSTICO'], TRACE).join('\n'), headers: {} };
+}
 
 const RELOJ = typeof setTimeout === 'function';
 const PRESUPUESTO = RELOJ ? 42000 : 25000;
@@ -283,21 +319,25 @@ async function resolverVoe(url, referer) {
 
 /* ------------------------- VidHide / StreamWish (packer) ------------------------- */
 
+function videoEmpaquetado(html, url) {
+  const codigo = `${desempacar(html)}\n${html}`;
+  const links = codigo.match(/links\s*=\s*(\{[^}]+\})/);
+  let video = '';
+  if (links) {
+    try {
+      const o = JSON.parse(links[1].replace(/'/g, '"'));
+      video = o.hls4 || o.hls3 || o.hls2 || o.hls || '';
+    } catch (e) {}
+  }
+  return absoluta(video || buscarVideo(codigo, url), url);
+}
+
 async function resolverEmpaquetado(url, servidor, referer, siguiendo) {
   const propio = `${origen(url)}/`;
   for (const ref of [...new Set([referer || propio, propio])]) {
     const html = await texto(url, { headers: { Referer: ref } });
     if (!html) continue;
-    const codigo = `${desempacar(html)}\n${html}`;
-    const links = codigo.match(/links\s*=\s*(\{[^}]+\})/);
-    let video = '';
-    if (links) {
-      try {
-        const o = JSON.parse(links[1].replace(/'/g, '"'));
-        video = o.hls4 || o.hls3 || o.hls2 || o.hls || '';
-      } catch (e) {}
-    }
-    video = absoluta(video || buscarVideo(codigo, url), url);
+    const video = videoEmpaquetado(html, url);
     if (video) return enlace(video, servidor, { Referer: propio, Origin: origen(url), 'User-Agent': UA });
     const marco = html.match(/<iframe[^>]+src=["']([^"']+)["']/i);
     if (marco && !siguiendo) return resolverEmpaquetado(absoluta(marco[1], url), servidor, url, true);
@@ -305,13 +345,51 @@ async function resolverEmpaquetado(url, servidor, referer, siguiendo) {
   return [];
 }
 
+// StreamWish/StreamHG (patrón probado en AnimeJara): varios referers, dominios espejo,
+// seguimiento de redirecciones JS y UA móvil tanto al leer el embed como al reproducir.
+async function paginaWish(url, referer) {
+  let actual = url;
+  let ref = referer;
+  for (let i = 0; i < 2; i++) {
+    const r = await pedir(actual, { headers: { 'User-Agent': UA_MOVIL, Referer: ref, 'Accept-Language': 'es-419,es;q=0.9' } });
+    if (!r || !r.ok) {
+      trace(`wish ${dominio(actual)}: ${r ? `HTTP ${r.status}` : 'sin respuesta'}`);
+      return null;
+    }
+    const html = (await conLimite(r.text(), 10000, '')) || '';
+    const pagina = r.url || actual;
+    const video = videoEmpaquetado(html, pagina);
+    if (video) return { video, pagina };
+    const salto = html.match(/(?:window\.)?location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/i) || html.match(/location\.replace\(\s*['"]([^'"]+)['"]/i);
+    const marco = html.match(/<iframe[^>]+src=["']([^"']+)["']/i);
+    const siguiente = salto ? absoluta(salto[1], pagina) : marco ? absoluta(marco[1], pagina) : '';
+    if (!siguiente || siguiente === actual) {
+      trace(`wish ${dominio(pagina)}: sin video (${html.length}B)`);
+      return null;
+    }
+    ref = pagina;
+    actual = siguiente;
+  }
+  return null;
+}
+
 async function resolverStreamwish(url, referer) {
-  const propio = await resolverEmpaquetado(url, 'StreamWish', referer);
-  if (propio.length) return propio;
   const id = url.replace(/[?#].*$/, '').split('/').filter(Boolean).pop().replace(/\.html$/, '');
-  const espejos = [`https://hglink.to/e/${id}`, `https://streamwish.to/e/${id}`, `https://vibuxer.com/e/${id}`].filter((e) => dominio(e) !== dominio(url));
-  const listas = await Promise.all(espejos.map((e) => resolverEmpaquetado(e, 'StreamWish', referer, true)));
-  return listas.find((l) => l.length) || [];
+  const propio = `${origen(url)}/`;
+  const intentos = [];
+  for (const r of [...new Set([propio, referer || `${BASES[0]}/`, `${BASES[0]}/`])]) intentos.push({ u: url, r });
+  for (const b of ['https://hglink.to/e/', 'https://streamwish.to/e/', 'https://vibuxer.com/e/', 'https://hgcloud.to/e/']) {
+    if (origen(b + id) !== origen(url)) intentos.push({ u: b + id, r: `${origen(b)}/` });
+  }
+  for (const it of intentos) {
+    if (restante() < 3000) break;
+    const res = await paginaWish(it.u, it.r);
+    if (res) {
+      const o = origen(res.pagina);
+      return enlace(res.video, 'StreamWish', { Referer: `${o}/`, Origin: o, 'User-Agent': UA_MOVIL });
+    }
+  }
+  return [];
 }
 
 const SERVIDORES = [
@@ -415,6 +493,7 @@ async function enlacesPagina(html, base, pagina) {
   for (const u of urlsDeFragmento(html, pagina)) agregar(u, general);
   const resueltos = await Promise.all(items.map(async (it) => {
     const reales = await desenvolver(it.url, base, pagina);
+    if (!reales.length) trace(`ignorado: ${dominio(it.url)}`);
     return reales.map((u) => ({ url: u, audio: it.audio, referer: pagina }));
   }));
   const finales = [];
@@ -486,6 +565,7 @@ function titulosPosibles(d) {
 async function buscar(base, titulos, tipo) {
   for (const titulo of titulos) {
     const html = await texto(`${base}/search?s=${encodeURIComponent(titulo)}`);
+    trace(`busqueda "${titulo.slice(0, 25)}": ${html.length}B`);
     let mejor = null;
     let puntos = 0;
     const patron = /<a[^>]+href=["']([^"']+)["'][^>]*class=["'][^"']*Posters-link[^"']*["'][\s\S]*?<p[^>]*>([\s\S]*?)<\/p>|<a[^>]+class=["'][^"']*Posters-link[^"']*["'][^>]*href=["']([^"']+)["'][\s\S]*?<p[^>]*>([\s\S]*?)<\/p>/gi;
@@ -542,25 +622,87 @@ function tarjeta(titulo, s) {
   return t;
 }
 
+// Diagnóstico (solo con DEBUG): revisa lista -> variante -> primer segmento y lo anota en el panel.
+async function sondaHls(s, etiqueta) {
+  if (!DEBUG || s.type !== 'hls' || restante() < 6000) return;
+  const h = s.headers || {};
+  const m = await pedir(s.url, { headers: h, limite: 6000 });
+  if (!m || !m.ok) {
+    trace(`${etiqueta} lista: ${m ? `HTTP ${m.status}` : 'sin respuesta'}`);
+    return;
+  }
+  const maestro = (await conLimite(m.text(), 8000, '')) || '';
+  if (!/#EXTM3U/.test(maestro)) {
+    trace(`${etiqueta} no es m3u8: ${maestro.slice(0, 40)}`);
+    return;
+  }
+  let lista = maestro;
+  let urlLista = m.url || s.url;
+  if (/#EXT-X-STREAM-INF/.test(maestro)) {
+    const hijo = maestro.split(/\r?\n/).find((l) => l.trim() && !l.startsWith('#'));
+    urlLista = absoluta(hijo.trim(), urlLista);
+    const r2 = await pedir(urlLista, { headers: h, limite: 6000 });
+    if (!r2 || !r2.ok) {
+      trace(`${etiqueta} variante: ${r2 ? `HTTP ${r2.status}` : 'sin respuesta'}`);
+      return;
+    }
+    lista = (await conLimite(r2.text(), 8000, '')) || '';
+    urlLista = r2.url || urlLista;
+  }
+  const segs = lista.split(/\r?\n/).filter((l) => l.trim() && !l.startsWith('#'));
+  let dur = 0;
+  lista.replace(/#EXTINF:([\d.]+)/g, (_, d) => {
+    dur += parseFloat(d);
+    return '';
+  });
+  if (!segs.length) {
+    trace(`${etiqueta} variante sin segmentos`);
+    return;
+  }
+  const seg = absoluta(segs[0].trim(), urlLista);
+  const r3 = await pedir(seg, { headers: Object.assign({}, h, { Range: 'bytes=0-2047' }), limite: 6000 });
+  const ct = r3 && r3.headers && r3.headers.get('content-type');
+  trace(`${etiqueta}: ${segs.length} seg, ${Math.round(dur / 60)}min, ${/#EXT-X-ENDLIST/.test(lista) ? 'VOD' : 'sin ENDLIST'}, 1er seg ${r3 ? `HTTP ${r3.status}` : 'sin respuesta'} ${ct ? String(ct).slice(0, 25) : ''} @${dominio(seg)}`);
+}
+
 async function armar(lista, titulo) {
   const resolverItem = async (item) => {
     const srv = servidorDe(item.url);
     if (!srv) return [];
     let salida = [];
+    let motivo = '';
     try {
       salida = await srv[2](item.url, item.referer);
     } catch (e) {
-      salida = [];
+      motivo = (e && e.message) || 'error';
     }
+    if (!salida.length) {
+      anotarEstado(srv[0], false, item.audio, motivo);
+      trace(`${srv[0]} (${item.audio || '?'}) sin video | ${dominio(item.url)}`);
+      return [];
+    }
+    anotarEstado(srv[0], true, item.audio);
     for (const s of salida) {
       s.servidor = srv[0];
       s.audio = item.audio;
       if (!s.type && esHls(s.url)) s.type = 'hls';
       if (!s.calidad) s.calidad = (await calidadHls(s.url, s.headers)) || calidadTexto(s.url);
     }
+    await Promise.all(salida.map((s) => sondaHls(s, `${srv[0]}/${item.audio || '?'}`)));
     return salida;
   };
-  const resultados = await Promise.all(lista.map((it) => conLimite(resolverItem(it), Math.max(1000, CIERRE - 6000 - (Date.now() - inicio)), [])));
+  const resultados = await Promise.all(lista.map(async (it) => {
+    const r = await conLimite(resolverItem(it), Math.max(1000, CIERRE - 6000 - (Date.now() - inicio)), null);
+    if (r === null) {
+      const srv = servidorDe(it.url);
+      if (srv) {
+        anotarEstado(srv[0], false, it.audio, 'tiempo agotado');
+        trace(`${srv[0]} tiempo agotado | ${dominio(it.url)}`);
+      }
+      return [];
+    }
+    return r;
+  }));
   const vistos = new Set();
   const tarjetas = [];
   for (const s of [].concat(...resultados)) {
@@ -574,31 +716,49 @@ async function armar(lista, titulo) {
 /* ---------------------------------- entrada ---------------------------------- */
 
 async function getStreams(tmdbId, mediaType, season, episode) {
+  TRACE = [];
+  ESTADO = {};
+  let titulo = '';
   try {
     inicio = Date.now();
     caidos.clear();
+    trace(`${FUENTE} v${VERSION}`);
     const tipo = mediaType === 'movie' ? 'movie' : 'tv';
     const datos = await datosTmdb(tmdbId, tipo);
-    if (!datos) return [];
+    if (!datos) {
+      trace('TMDB fallo');
+      return DEBUG ? [entradaEstado('')] : [];
+    }
     const temporada = Number(season) || 1;
     const episodio = Number(episode) || 1;
-    const titulo = tipo === 'tv' ? `${datos.titulo} - T${temporada} E${episodio}` : (datos.anio ? `${datos.titulo} (${datos.anio})` : datos.titulo);
+    titulo = tipo === 'tv' ? `${datos.titulo} - T${temporada} E${episodio}` : (datos.anio ? `${datos.titulo} (${datos.anio})` : datos.titulo);
+    trace(`TMDB: ${titulo}`);
 
     for (const base of BASES) {
+      trace(`base ${dominio(base)}`);
       let pagina = await buscar(base, titulosPosibles(datos), tipo);
-      if (!pagina) continue;
+      if (!pagina) {
+        trace('sin coincidencia en la busqueda');
+        continue;
+      }
       if (tipo === 'tv') pagina = `${pagina.replace(/\/+$/, '')}/temporada/${temporada}/capitulo/${episodio}`;
+      trace(`pagina: ${pagina.replace(base, '')}`);
       const html = await texto(pagina, { headers: { Referer: `${base}/` } });
-      if (!html) continue;
+      if (!html) {
+        trace('pagina sin HTML (HTTP/Cloudflare)');
+        continue;
+      }
       const lista = await enlacesPagina(html, base, pagina);
+      trace(`${lista.length} enlaces soportados (HTML ${html.length}B, ${(html.match(/<iframe/gi) || []).length} iframes)`);
       if (!lista.length) continue;
       const tarjetas = await armar(lista, titulo);
-      if (tarjetas.length) return tarjetas;
+      trace(`${tarjetas.length} streams`);
+      if (tarjetas.length) return DEBUG ? tarjetas.concat([entradaEstado(titulo)]) : tarjetas;
     }
-    return [];
+    return DEBUG ? [entradaEstado(titulo)] : [];
   } catch (e) {
-    console.log(`[${FUENTE}] ${e.message}`);
-    return [];
+    trace(`error: ${e && e.message}`);
+    return DEBUG ? [entradaEstado(titulo)] : [];
   }
 }
 

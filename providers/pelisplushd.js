@@ -259,7 +259,7 @@ async function resolverVoe(url, referer) {
     actual = absoluta(salto[1], actual);
   }
   if (!html) return [];
-  const cab = { Referer: actual, 'User-Agent': UA };
+  const cab = { Referer: `${origen(actual)}/`, 'User-Agent': UA };
   const bloque = html.match(/<script type="application\/json">([\s\S]*?)<\/script>(?:\s*<script[^>]*src=["']([^"']+)["'])?/i);
   if (bloque) {
     let cifrado = '';
@@ -507,7 +507,11 @@ async function buscar(base, titulos, tipo) {
 
 /* ------------------------------ tarjetas Nuvio ------------------------------ */
 
-const TELE = typeof __plugin_sleep !== 'function' && typeof __cheerio_load === 'function';
+function esHls(url) {
+  const u = String(url || '');
+  if (/\.mp4(\?|#|$)/i.test(u)) return false;
+  return /\.m3u8|\.txt(\?|#|$)|urlset|\/hls|master|playlist|\/stream\//i.test(u);
+}
 
 function pesoCalidad(c) {
   if (/4k/i.test(c)) return 2160;
@@ -518,20 +522,23 @@ function pesoAudio(a) {
   return { Latino: 3, 'Español': 2, Castellano: 1 }[a] || 0;
 }
 
+function banderaAudio(a) {
+  if (a === 'Latino') return '\uD83C\uDDF2\uD83C\uDDFD LATINO';
+  if (a === 'Castellano') return '\uD83C\uDDEA\uD83C\uDDF8 CASTELLANO';
+  if (a === 'Subtitulado') return '\uD83C\uDDEF\uD83C\uDDF5 SUBTITULADO';
+  return a ? a.toUpperCase() : '';
+}
+
 function tarjeta(titulo, s) {
+  const formato = s.type === 'hls' ? 'HLS' : 'MP4';
   const t = {
-    name: `${FUENTE} (${s.servidor})`,
-    title: titulo,
+    name: FUENTE,
+    title: '',
     url: s.url,
-    quality: `Calidad: ${s.calidad || 'Auto'}`,
-    provider: FUENTE
+    quality: [`\uD83D\uDCFA ${s.servidor} (${formato})`, `${s.calidad || 'HD'} | WEB-DL`, banderaAudio(s.audio), `\uD83D\uDD17 ${titulo}`].filter(Boolean).join('\n'),
+    headers: s.headers || {}
   };
-  if (s.audio) t.language = `Audio: ${s.audio}`;
-  if (TELE) {
-    t.size = t.quality;
-    t.quality = t.name;
-  }
-  if (s.headers && Object.keys(s.headers).length) t.headers = s.headers;
+  if (s.type) t.type = s.type;
   return t;
 }
 
@@ -548,6 +555,7 @@ async function armar(lista, titulo) {
     for (const s of salida) {
       s.servidor = srv[0];
       s.audio = item.audio;
+      if (!s.type && esHls(s.url)) s.type = 'hls';
       if (!s.calidad) s.calidad = (await calidadHls(s.url, s.headers)) || calidadTexto(s.url);
     }
     return salida;

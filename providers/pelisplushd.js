@@ -5,7 +5,14 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const FUENTE = 'PelisPlusHD';
 const BASES = ['https://pelisplushd.bz', 'https://www.pelisplushd.la', 'https://ww3.pelisplus.to'];
 const TMDB_KEY = '439c478a771f35c05022f9feabcca01c';
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
+let CryptoJS = null;
+try {
+  CryptoJS = require('crypto-js');
+} catch (e) {}
+
+// Servidores activos. VidHide queda apagado: en SeriesKao "responde pero no reproduce".
+const ENABLED = { Voe: true, StreamWish: true, VidHide: false };
 const UA_MOVIL = 'Mozilla/5.0 (Linux; Android 13; moto g82 5G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36';
 
 // DEBUG: agrega al final de la lista una entrada "ESTADO DE REPRODUCTORES" (no reproducible)
@@ -310,7 +317,11 @@ async function resolverVoe(url, referer) {
       if (lista) datos = descifrarVoe(cifrado, (lista.match(/['"]([^'"]{1,10})['"]/g) || []).map((x) => x.slice(1, -1)));
     }
     const video = datos && (datos.source || datos.direct_access_url);
-    if (video) return enlace(video, 'Voe', cab);
+    const mp4 = datos && datos.fallback && datos.fallback[0] && datos.fallback[0].file;
+    const salida = [];
+    if (video) salida.push(...enlace(video, 'Voe', cab));
+    if (mp4) salida.push(...enlace(mp4, 'Voe', { 'User-Agent': UA }));
+    if (salida.length) return salida;
   }
   const directo = html.match(/['"]hls['"]\s*:\s*['"]([^'"]+)['"]/i);
   if (directo) return enlace(/^aHR0/.test(directo[1]) ? atobSeguro(directo[1]) : directo[1], 'Voe', cab);
@@ -540,11 +551,12 @@ async function datosTmdb(tmdbId, tipo) {
     id = String(r[0].id);
   }
   const ruta = `https://api.themoviedb.org/3/${tipo}/${id}?api_key=${TMDB_KEY}`;
-  const [es, en] = await Promise.all([json(`${ruta}&language=es-MX`), json(`${ruta}&language=en-US`)]);
+  const [es, en] = await Promise.all([json(`${ruta}&language=es-MX&append_to_response=external_ids`), json(`${ruta}&language=en-US`)]);
   if (!es && !en) return null;
   const a = es || {};
   const b = en || {};
   return {
+    imdb: (/^tt\d+$/.test(String(tmdbId)) ? String(tmdbId) : '') || (a.external_ids && a.external_ids.imdb_id) || a.imdb_id || b.imdb_id || '',
     titulo: a.title || a.name || b.title || b.name || '',
     ingles: b.title || b.name || '',
     original: a.original_title || a.original_name || b.original_title || b.original_name || '',
@@ -562,27 +574,172 @@ function titulosPosibles(d) {
   });
 }
 
+function candidatosBusqueda(html, base) {
+  const salida = [];
+  const vistos = new Set();
+  const patron = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = patron.exec(html))) {
+    const href = (m[1].match(/\bhref=["']([^"']+)["']/i) || [])[1];
+    if (!href) continue;
+    const url = absoluta(href, base);
+    if (dominio(url) !== dominio(base)) continue;
+    const ruta = url.replace(/^https?:\/\/[^/]+/, '').replace(/[?#].*$/, '').replace(/\/+$/, '');
+    const partes = ruta.split('/').filter(Boolean);
+    if (partes.length < 2 || /\/(temporada|capitulo|episodio|genero|categoria|page|search)\//.test(`${ruta}/`)) continue;
+    if (vistos.has(ruta)) continue;
+    vistos.add(ruta);
+    const textos = [
+      (m[1].match(/\btitle=["']([^"']+)["']/i) || [])[1],
+      (m[2].match(/\balt=["']([^"']+)["']/i) || [])[1],
+      (m[2].match(/<(?:h\d|p|span|strong)\b[^>]*>([\s\S]*?)<\/(?:h\d|p|span|strong)>/i) || [])[1],
+      limpiarHtml(m[2]),
+      partes[partes.length - 1].replace(/-/g, ' ')
+    ].filter(Boolean).map((x) => limpiarHtml(x)).filter((x) => x && x.length < 120);
+    salida.push({ url, ruta, esPelicula: /\/pelicula\//i.test(ruta), textos });
+  }
+  return salida;
+}
+
 async function buscar(base, titulos, tipo) {
+  let mejor = null;
+  let puntos = 0;
   for (const titulo of titulos) {
     const html = await texto(`${base}/search?s=${encodeURIComponent(titulo)}`);
-    trace(`busqueda "${titulo.slice(0, 25)}": ${html.length}B`);
-    let mejor = null;
-    let puntos = 0;
-    const patron = /<a[^>]+href=["']([^"']+)["'][^>]*class=["'][^"']*Posters-link[^"']*["'][\s\S]*?<p[^>]*>([\s\S]*?)<\/p>|<a[^>]+class=["'][^"']*Posters-link[^"']*["'][^>]*href=["']([^"']+)["'][\s\S]*?<p[^>]*>([\s\S]*?)<\/p>/gi;
-    let m;
-    while ((m = patron.exec(html))) {
-      const href = m[1] || m[3];
-      const nombre = limpiarHtml(m[2] || m[4]);
-      if ((tipo === 'movie') !== /\/pelicula\//.test(href)) continue;
-      const s = parecido(nombre, titulo);
+    const todos = candidatosBusqueda(html, base);
+    const lista = todos.filter((c) => (tipo === 'movie') === c.esPelicula);
+    trace(`busqueda "${titulo.slice(0, 22)}": ${html.length}B, ${todos.length} enlaces, ${lista.length} del tipo`);
+    if (!todos.length && html.length > 2000) {
+      const prefijos = {};
+      (html.match(/href=["'](?:https?:\/\/[^/"']+)?\/[^"'/?#]*/gi) || []).forEach((h) => {
+        const k = h.replace(/^href=["'](?:https?:\/\/[^/"']+)?/i, '');
+        prefijos[k] = (prefijos[k] || 0) + 1;
+      });
+      trace(`rutas: ${Object.keys(prefijos).sort((a, b) => prefijos[b] - prefijos[a]).slice(0, 6).map((k) => `${k}(${prefijos[k]})`).join(' ')}`);
+    }
+    for (const c of lista) {
+      let s = 0;
+      for (const x of c.textos) for (const tt of titulos) s = Math.max(s, parecido(x, tt));
       if (s > puntos) {
         puntos = s;
-        mejor = absoluta(href, base);
+        mejor = c;
       }
     }
-    if (mejor && puntos >= 0.8) return mejor;
+    if (mejor && puntos >= 0.8) break;
   }
-  return null;
+  if (mejor) trace(`mejor: ${mejor.ruta.slice(0, 45)} (${puntos.toFixed(2)})`);
+  return mejor && puntos >= 0.8 ? mejor.url : null;
+}
+
+/* ------------------------- respaldo: /vidurl/<imdb> (dataLink cifrado) ------------------------- */
+
+const SHA_K = Int32Array.from([0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2]);
+const SHA_M = new Int32Array(64);
+
+function sha256Palabras(txt) {
+  const largo = txt.length;
+  const bloques = ((largo + 9 + 63) >> 6) << 4;
+  const w = new Int32Array(bloques);
+  for (let i = 0; i < largo; i++) w[i >> 2] |= (txt.charCodeAt(i) & 255) << (24 - (i & 3) * 8);
+  w[largo >> 2] |= 0x80 << (24 - (largo & 3) * 8);
+  w[bloques - 1] = largo * 8;
+  let h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a, h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+  const m = SHA_M;
+  for (let b = 0; b < bloques; b += 16) {
+    for (let i = 0; i < 16; i++) m[i] = w[b + i] | 0;
+    for (let i = 16; i < 64; i++) {
+      const x = m[i - 15];
+      const y = m[i - 2];
+      const s0 = ((x >>> 7) | (x << 25)) ^ ((x >>> 18) | (x << 14)) ^ (x >>> 3);
+      const s1 = ((y >>> 17) | (y << 15)) ^ ((y >>> 19) | (y << 13)) ^ (y >>> 10);
+      m[i] = (m[i - 16] + s0 + m[i - 7] + s1) | 0;
+    }
+    let a = h0, bb = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+    for (let i = 0; i < 64; i++) {
+      const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+      const t1 = (h + S1 + ((e & f) ^ (~e & g)) + SHA_K[i] + m[i]) | 0;
+      const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+      const t2 = (S0 + ((a & bb) ^ (a & c) ^ (bb & c))) | 0;
+      h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = bb; bb = a; a = (t1 + t2) | 0;
+    }
+    h0 = (h0 + a) | 0; h1 = (h1 + bb) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0; h4 = (h4 + e) | 0; h5 = (h5 + f) | 0; h6 = (h6 + g) | 0; h7 = (h7 + h) | 0;
+  }
+  return [h0, h1, h2, h3, h4, h5, h6, h7];
+}
+
+function nonceTrabajo(reto, dificultad) {
+  for (let n = 0; n < 20000000; n++) {
+    const p = sha256Palabras(reto + n);
+    let ok = true;
+    for (let i = 0; i < dificultad && ok; i++) {
+      if (((p[i >> 3] >>> (28 - (i & 7) * 4)) & 15) !== 0) ok = false;
+    }
+    if (ok) return n;
+  }
+  return -1;
+}
+
+const AUDIO_COD = { LAT: 'Latino', ESP: 'Castellano', CAS: 'Castellano', SUB: 'Subtitulado', '0': 'Latino', '1': 'Castellano', '2': 'Subtitulado' };
+
+function leerDataLink(html) {
+  const bloque = html.match(/(?:let|var)\s+dataLink\s*=\s*(\[[\s\S]*?\]);/);
+  if (!bloque) return { error: 'sin dataLink', lista: [] };
+  if (!CryptoJS) return { error: 'falta crypto-js', lista: [] };
+  let grupos = [];
+  try {
+    grupos = JSON.parse(bloque[1]);
+  } catch (e) {
+    return { error: 'dataLink ilegible', lista: [] };
+  }
+  const reto = (html.match(/POW_CHALLENGE\s*=\s*'([^']+)'/) || [])[1];
+  const sal = (html.match(/POW_SALT\s*=\s*'([^']+)'/) || [])[1];
+  const dificultad = parseInt((html.match(/POW_DIFFICULTY\s*=\s*(\d+)/) || [])[1], 10);
+  let clave = null;
+  if (reto && sal && dificultad) {
+    const n = nonceTrabajo(reto, dificultad);
+    if (n < 0) return { error: 'POW sin solucion', lista: [] };
+    clave = CryptoJS.SHA256(reto + n + sal);
+  }
+  const lista = [];
+  for (const g of grupos) {
+    const audio = AUDIO_COD[String(g.video_language).toUpperCase()] || '';
+    for (const e of g.sortedEmbeds || []) {
+      if (!e.link || e.servername === 'download') continue;
+      let destino = e.link;
+      if (clave) {
+        try {
+          const crudo = CryptoJS.enc.Base64.parse(e.link);
+          const vector = CryptoJS.lib.WordArray.create(crudo.words.slice(0, 4), 16);
+          const cuerpo = CryptoJS.lib.WordArray.create(crudo.words.slice(4), crudo.sigBytes - 16);
+          destino = CryptoJS.AES.decrypt({ ciphertext: cuerpo }, clave, { iv: vector, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 }).toString(CryptoJS.enc.Utf8);
+        } catch (err) {
+          destino = '';
+        }
+      }
+      if (/^https?:\/\//.test(destino)) lista.push({ url: destino, audio });
+    }
+  }
+  return { error: '', lista };
+}
+
+async function viaVidurl(base, imdb, tipo, temporada, episodio) {
+  if (!imdb) {
+    trace('vidurl: sin IMDb');
+    return [];
+  }
+  const ruta = tipo === 'movie' ? `${imdb}/` : `${imdb}-${temporada}x${String(episodio).padStart(2, '0')}/`;
+  const html = await texto(`${base}/vidurl/${ruta}`, { headers: { Referer: `${base}/` } });
+  if (!html) {
+    trace(`vidurl ${dominio(base)}: sin respuesta/404`);
+    return [];
+  }
+  const r = leerDataLink(html);
+  trace(`vidurl ${dominio(base)}: ${r.error || `${r.lista.length} embeds`}`);
+  return r.lista.filter((x) => {
+    if (servidorDe(x.url)) return true;
+    trace(`ignorado: ${dominio(x.url)}`);
+    return false;
+  }).map((x) => ({ url: x.url, audio: x.audio, referer: `${base}/` }));
 }
 
 /* ------------------------------ tarjetas Nuvio ------------------------------ */
@@ -669,6 +826,10 @@ async function armar(lista, titulo) {
   const resolverItem = async (item) => {
     const srv = servidorDe(item.url);
     if (!srv) return [];
+    if (!ENABLED[srv[0]]) {
+      trace(`omitido (desactivado): ${srv[0]}`);
+      return [];
+    }
     let salida = [];
     let motivo = '';
     try {
@@ -736,20 +897,22 @@ async function getStreams(tmdbId, mediaType, season, episode) {
 
     for (const base of BASES) {
       trace(`base ${dominio(base)}`);
+      let lista = [];
       let pagina = await buscar(base, titulosPosibles(datos), tipo);
-      if (!pagina) {
+      if (pagina) {
+        if (tipo === 'tv') pagina = `${pagina.replace(/\/+$/, '')}/temporada/${temporada}/capitulo/${episodio}`;
+        trace(`pagina: ${pagina.replace(base, '')}`);
+        const html = await texto(pagina, { headers: { Referer: `${base}/` } });
+        if (html) {
+          lista = await enlacesPagina(html, base, pagina);
+          trace(`${lista.length} enlaces soportados (HTML ${html.length}B, ${(html.match(/<iframe/gi) || []).length} iframes)`);
+        } else {
+          trace('pagina sin HTML (HTTP/Cloudflare)');
+        }
+      } else {
         trace('sin coincidencia en la busqueda');
-        continue;
       }
-      if (tipo === 'tv') pagina = `${pagina.replace(/\/+$/, '')}/temporada/${temporada}/capitulo/${episodio}`;
-      trace(`pagina: ${pagina.replace(base, '')}`);
-      const html = await texto(pagina, { headers: { Referer: `${base}/` } });
-      if (!html) {
-        trace('pagina sin HTML (HTTP/Cloudflare)');
-        continue;
-      }
-      const lista = await enlacesPagina(html, base, pagina);
-      trace(`${lista.length} enlaces soportados (HTML ${html.length}B, ${(html.match(/<iframe/gi) || []).length} iframes)`);
+      if (!lista.length) lista = await viaVidurl(base, datos.imdb, tipo, temporada, episodio);
       if (!lista.length) continue;
       const tarjetas = await armar(lista, titulo);
       trace(`${tarjetas.length} streams`);

@@ -5,7 +5,7 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const FUENTE = 'PelisPlusHD';
 const BASES = ['https://pelisplushd.bz', 'https://www.pelisplushd.la', 'https://ww3.pelisplus.to'];
 const TMDB_KEY = '439c478a771f35c05022f9feabcca01c';
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 let CryptoJS = null;
 try {
   CryptoJS = require('crypto-js');
@@ -22,7 +22,8 @@ let TRACE = [];
 let ESTADO = {};
 
 function trace(m) {
-  if (TRACE.length < 60) TRACE.push(String(m).replace(/\s+/g, ' ').slice(0, 140));
+  const l = String(m).replace(/\s+/g, ' ').slice(0, 140);
+  if (TRACE.length < 70 && !TRACE.includes(l)) TRACE.push(l);
 }
 
 function anotarEstado(label, ok, audio, motivo) {
@@ -295,13 +296,29 @@ function descifrarVoe(cifrado, ruidos) {
 async function resolverVoe(url, referer) {
   let actual = url;
   let html = '';
+  let estado = '';
   for (let i = 0; i < 3; i++) {
-    html = await texto(actual, { headers: { Referer: i === 0 && referer ? referer : actual } });
+    const r = await pedir(actual, { headers: { Referer: i === 0 && referer ? referer : actual } });
+    if (!r) {
+      estado = 'sin respuesta';
+      html = '';
+      break;
+    }
+    estado = `HTTP ${r.status}`;
+    if (r.url) actual = r.url;
+    if (!r.ok) {
+      html = '';
+      break;
+    }
+    html = (await conLimite(r.text(), 10000, '')) || '';
     const salto = html.length < 4000 && html.match(/window\.location\.href\s*=\s*['"]([^'"]+)['"]/i);
     if (!salto) break;
     actual = absoluta(salto[1], actual);
   }
-  if (!html) return [];
+  if (!html) {
+    trace(`voe ${dominio(actual)}: ${estado}`);
+    return [];
+  }
   const cab = { Referer: `${origen(actual)}/`, 'User-Agent': UA };
   const bloque = html.match(/<script type="application\/json">([\s\S]*?)<\/script>(?:\s*<script[^>]*src=["']([^"']+)["'])?/i);
   if (bloque) {
@@ -325,10 +342,33 @@ async function resolverVoe(url, referer) {
   }
   const directo = html.match(/['"]hls['"]\s*:\s*['"]([^'"]+)['"]/i);
   if (directo) return enlace(/^aHR0/.test(directo[1]) ? atobSeguro(directo[1]) : directo[1], 'Voe', cab);
-  return enlace(buscarVideo(html, actual), 'Voe', cab);
+  const fin = enlace(buscarVideo(html, actual), 'Voe', cab);
+  if (!fin.length) {
+    const tit = (html.match(/<title[^>]*>([^<]*)/i) || [])[1] || '?';
+    trace(`voe ${dominio(actual)}: ${html.length}B, json=${/application\/json/.test(html) ? 'si' : 'no'}${/human|captcha|turnstile|robot|verif/i.test(html) ? ', ANTI-BOT' : ''}, titulo=${entidades(tit.trim()).slice(0, 30)}`);
+    if (html.length < 3000) trace(`voe cuerpo: ${html.replace(/\s+/g, ' ').slice(0, 120)}`);
+  }
+  return fin;
 }
 
 /* ------------------------- VidHide / StreamWish (packer) ------------------------- */
+
+function candidatosHls(html, url) {
+  const codigo = `${desempacar(html)}\n${html}`;
+  const salida = [];
+  const lm = codigo.match(/links\s*=\s*(\{[^}]+\})/);
+  if (lm) {
+    try {
+      const o = JSON.parse(lm[1].replace(/'/g, '"'));
+      for (const k of ['hls4', 'hls2', 'hls3', 'hls1', 'hls']) if (o[k]) salida.push({ k, url: absoluta(o[k], url) });
+    } catch (e) {}
+  }
+  if (!salida.length) {
+    const v = absoluta(buscarVideo(codigo, url), url);
+    if (v) salida.push({ k: '', url: v });
+  }
+  return salida;
+}
 
 function videoEmpaquetado(html, url) {
   const codigo = `${desempacar(html)}\n${html}`;
@@ -369,13 +409,13 @@ async function paginaWish(url, referer) {
     }
     const html = (await conLimite(r.text(), 10000, '')) || '';
     const pagina = r.url || actual;
-    const video = videoEmpaquetado(html, pagina);
-    if (video) return { video, pagina };
+    const videos = candidatosHls(html, pagina);
+    if (videos.length) return { videos, pagina };
     const salto = html.match(/(?:window\.)?location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/i) || html.match(/location\.replace\(\s*['"]([^'"]+)['"]/i);
     const marco = html.match(/<iframe[^>]+src=["']([^"']+)["']/i);
     const siguiente = salto ? absoluta(salto[1], pagina) : marco ? absoluta(marco[1], pagina) : '';
     if (!siguiente || siguiente === actual) {
-      trace(`wish ${dominio(pagina)}: sin video (${html.length}B)`);
+      trace(`wish ${dominio(pagina)}: sin video (${html.length}B) ${html.length < 1200 ? html.replace(/\s+/g, ' ').slice(0, 90) : ''}`);
       return null;
     }
     ref = pagina;
@@ -385,19 +425,32 @@ async function paginaWish(url, referer) {
 }
 
 async function resolverStreamwish(url, referer) {
-  const id = url.replace(/[?#].*$/, '').split('/').filter(Boolean).pop().replace(/\.html$/, '');
-  const propio = `${origen(url)}/`;
+  const inicial = url.replace('hglink.to', 'vibuxer.com');
+  const id = inicial.replace(/[?#].*$/, '').split('/').filter(Boolean).pop().replace(/\.html$/, '');
+  const propio = `${origen(inicial)}/`;
   const intentos = [];
-  for (const r of [...new Set([propio, referer || `${BASES[0]}/`, `${BASES[0]}/`])]) intentos.push({ u: url, r });
-  for (const b of ['https://hglink.to/e/', 'https://streamwish.to/e/', 'https://vibuxer.com/e/', 'https://hgcloud.to/e/']) {
-    if (origen(b + id) !== origen(url)) intentos.push({ u: b + id, r: `${origen(b)}/` });
+  for (const r of [...new Set([propio, referer || `${BASES[0]}/`, `${BASES[0]}/`])]) intentos.push({ u: inicial, r });
+  for (const b of ['https://hglink.to/e/', 'https://streamwish.to/e/', 'https://hgcloud.to/e/']) {
+    if (origen(b + id) !== origen(inicial)) intentos.push({ u: b + id, r: `${origen(b)}/` });
   }
   for (const it of intentos) {
     if (restante() < 3000) break;
     const res = await paginaWish(it.u, it.r);
     if (res) {
       const o = origen(res.pagina);
-      return enlace(res.video, 'StreamWish', { Referer: `${o}/`, Origin: o, 'User-Agent': UA_MOVIL });
+      const cab = { Referer: `${o}/`, Origin: o, 'User-Agent': UA_MOVIL };
+      trace(`wish ok en ${dominio(res.pagina)}: ${res.videos.map((v) => v.k || 'video').join(',')}`);
+      const salida = [];
+      const vistos = new Set();
+      for (const v of res.videos.slice(0, 3)) {
+        if (vistos.has(v.url)) continue;
+        vistos.add(v.url);
+        for (const e of enlace(v.url, 'StreamWish', cab)) {
+          e.tag = v.k ? `CDN ${v.k.replace('hls', '') || '1'}` : '';
+          salida.push(e);
+        }
+      }
+      return salida;
     }
   }
   return [];
@@ -684,7 +737,6 @@ const AUDIO_COD = { LAT: 'Latino', ESP: 'Castellano', CAS: 'Castellano', SUB: 'S
 function leerDataLink(html) {
   const bloque = html.match(/(?:let|var)\s+dataLink\s*=\s*(\[[\s\S]*?\]);/);
   if (!bloque) return { error: 'sin dataLink', lista: [] };
-  if (!CryptoJS) return { error: 'falta crypto-js', lista: [] };
   let grupos = [];
   try {
     grupos = JSON.parse(bloque[1]);
@@ -696,6 +748,7 @@ function leerDataLink(html) {
   const dificultad = parseInt((html.match(/POW_DIFFICULTY\s*=\s*(\d+)/) || [])[1], 10);
   let clave = null;
   if (reto && sal && dificultad) {
+    if (!CryptoJS) return { error: 'falta crypto-js', lista: [] };
     const n = nonceTrabajo(reto, dificultad);
     if (n < 0) return { error: 'POW sin solucion', lista: [] };
     clave = CryptoJS.SHA256(reto + n + sal);
@@ -772,7 +825,7 @@ function tarjeta(titulo, s) {
     name: FUENTE,
     title: '',
     url: s.url,
-    quality: [`\uD83D\uDCFA ${s.servidor} (${formato})`, `${s.calidad || 'HD'} | WEB-DL`, banderaAudio(s.audio), `\uD83D\uDD17 ${titulo}`].filter(Boolean).join('\n'),
+    quality: [`\uD83D\uDCFA ${s.servidor} (${formato})${s.tag ? ` [${s.tag}]` : ''}${s.sano === false ? ' \u26A0' : ''}`, `${s.calidad || 'HD'} | WEB-DL`, banderaAudio(s.audio), `\uD83D\uDD17 ${titulo}`].filter(Boolean).join('\n'),
     headers: s.headers || {}
   };
   if (s.type) t.type = s.type;
@@ -819,7 +872,8 @@ async function sondaHls(s, etiqueta) {
   const seg = absoluta(segs[0].trim(), urlLista);
   const r3 = await pedir(seg, { headers: Object.assign({}, h, { Range: 'bytes=0-2047' }), limite: 6000 });
   const ct = r3 && r3.headers && r3.headers.get('content-type');
-  trace(`${etiqueta}: ${segs.length} seg, ${Math.round(dur / 60)}min, ${/#EXT-X-ENDLIST/.test(lista) ? 'VOD' : 'sin ENDLIST'}, 1er seg ${r3 ? `HTTP ${r3.status}` : 'sin respuesta'} ${ct ? String(ct).slice(0, 25) : ''} @${dominio(seg)}`);
+  s.sano = !!(r3 && r3.status < 400 && !/image\//i.test(String(ct || '')));
+  trace(`${etiqueta}${s.tag ? ` ${s.tag}` : ''}: ${segs.length} seg, ${Math.round(dur / 60)}min, ${/#EXT-X-ENDLIST/.test(lista) ? 'VOD' : 'sin ENDLIST'}, 1er seg ${r3 ? `HTTP ${r3.status}` : 'sin respuesta'} ${ct ? String(ct).slice(0, 25) : ''} @${dominio(seg)}${s.sano ? '' : ' \u26A0'}`);
 }
 
 async function armar(lista, titulo) {
@@ -869,7 +923,7 @@ async function armar(lista, titulo) {
   for (const s of [].concat(...resultados)) {
     if (!s.url || vistos.has(s.url)) continue;
     vistos.add(s.url);
-    tarjetas.push({ orden: pesoAudio(s.audio) * 10000 + pesoCalidad(s.calidad), t: tarjeta(titulo, s) });
+    tarjetas.push({ orden: pesoAudio(s.audio) * 100000 + (s.sano === false ? 0 : 10000) + pesoCalidad(s.calidad), t: tarjeta(titulo, s) });
   }
   return tarjetas.sort((a, b) => b.orden - a.orden).map((x) => x.t);
 }

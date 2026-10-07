@@ -1,14 +1,14 @@
 {
-  "name": "PelisPlusHD Providers",
+  "name": "PelisPlusHD",
   "author": "tu-usuario",
   "description": "Proveedor de PelisPlusHD (Latino/Castellano) para Nuvio con Voe, VidHide y StreamWish",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "scrapers": [
     {
       "id": "pelisplushd",
       "name": "PelisPlusHD",
-      "description": "Películas y series en español desde pelisplushd.bz (Voe, VidHide, StreamWish)",
-      "version": "1.0.0",
+      "description": "P",
+      "version": "1.0.1",
       "author": "tu-usuario",
       "supportedTypes": ["movie", "tv"],
       "enabled": true,

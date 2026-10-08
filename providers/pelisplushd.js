@@ -3,21 +3,22 @@
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36';
 const FUENTE = 'PelisPlusHD';
-const BASES = ['https://pelisplushd.bz', 'https://www.pelisplushd.la', 'https://ww3.pelisplus.to'];
+const BASES = ['https://pelisplushd.bz', 'https://www.pelisplushd.la'];
 const TMDB_KEY = '439c478a771f35c05022f9feabcca01c';
-const VERSION = '1.4.0';
+const VERSION = '1.7.0';
 let CryptoJS = null;
 try {
   CryptoJS = require('crypto-js');
 } catch (e) {}
 
 // Servidores activos. VidHide queda apagado: en SeriesKao "responde pero no reproduce".
-const ENABLED = { Voe: true, StreamWish: true, VidHide: false };
+// Voe: apagado (pide verificación anti-bot). VidHide: apagado (responde pero no reproduce).
+const ENABLED = { Voe: false, StreamWish: true, VidHide: false };
 const UA_MOVIL = 'Mozilla/5.0 (Linux; Android 13; moto g82 5G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36';
 
-// DEBUG: agrega al final de la lista una entrada "ESTADO DE REPRODUCTORES" (no reproducible)
-// con lo que pasó en cada paso. Poner en false cuando todo funcione.
-const DEBUG = true;
+// DEBUG: poner en true para agregar al final de la lista una entrada "ESTADO DE REPRODUCTORES"
+// (no reproducible) con lo que pasó en cada paso. Apagado = lista limpia.
+const DEBUG = false;
 let TRACE = [];
 let ESTADO = {};
 
@@ -55,6 +56,9 @@ const PRESUPUESTO = RELOJ ? 42000 : 25000;
 const CIERRE = RELOJ ? 50000 : 40000;
 let inicio = Date.now();
 const caidos = new Set();
+// Hosts que respondieron 403/429: no se les vuelve a pedir nada por un rato (evita que te bloqueen la IP).
+const bloqueados = {};
+const ENFRIAMIENTO = 15 * 60 * 1000;
 
 /* ------------------------------ utilidades base ------------------------------ */
 
@@ -112,6 +116,10 @@ async function traer(url, opciones) {
 async function pedir(url, opciones) {
   const host = String(url || '').replace(/^https?:\/\//i, '').split(/[/?#]/)[0].toLowerCase();
   if (caidos.has(host) || restante() <= 0) return null;
+  if (bloqueados[host] && Date.now() - bloqueados[host] < ENFRIAMIENTO) {
+    trace(`${host}: en pausa (403/429 reciente)`);
+    return null;
+  }
   const o = Object.assign({}, opciones || {});
   const limite = Math.min(o.limite || CIERRE, CIERRE - (Date.now() - inicio));
   delete o.limite;
@@ -124,6 +132,11 @@ async function pedir(url, opciones) {
   if (r && !r.status) {
     caidos.add(host);
     return null;
+  }
+  if (r && (r.status === 403 || r.status === 429)) {
+    bloqueados[host] = Date.now();
+    caidos.add(host);
+    trace(`${host}: HTTP ${r.status}, no se insiste`);
   }
   return r;
 }
@@ -234,16 +247,6 @@ function calidadTexto(t) {
   if (/2160|4k|uhd/i.test(s)) return '4K';
   const m = s.match(/(1440|1080|720|480|360|240)\s*p?/i);
   return m ? `${m[1]}p` : '';
-}
-
-async function calidadHls(url, headers) {
-  if (!/m3u8|\/hls|master|playlist|\.txt/i.test(url) || restante() < 8000) return '';
-  const t = await texto(url, { headers, limite: 5000 });
-  let alto = 0;
-  const patron = /RESOLUTION=\d+x(\d+)/gi;
-  let m;
-  while ((m = patron.exec(t))) alto = Math.max(alto, parseInt(m[1], 10));
-  return etiquetaAltura(alto);
 }
 
 function enlace(url, servidor, headers, calidad) {
@@ -360,7 +363,7 @@ function candidatosHls(html, url) {
   if (lm) {
     try {
       const o = JSON.parse(lm[1].replace(/'/g, '"'));
-      for (const k of ['hls4', 'hls2', 'hls3', 'hls1', 'hls']) if (o[k]) salida.push({ k, url: absoluta(o[k], url) });
+      for (const k of ['hls2', 'hls3', 'hls4', 'hls1', 'hls']) if (o[k]) salida.push({ k, url: absoluta(o[k], url) });
     } catch (e) {}
   }
   if (!salida.length) {
@@ -433,7 +436,7 @@ async function resolverStreamwish(url, referer) {
   for (const b of ['https://hglink.to/e/', 'https://streamwish.to/e/', 'https://hgcloud.to/e/']) {
     if (origen(b + id) !== origen(inicial)) intentos.push({ u: b + id, r: `${origen(b)}/` });
   }
-  for (const it of intentos) {
+  for (const it of intentos.slice(0, 3)) {
     if (restante() < 3000) break;
     const res = await paginaWish(it.u, it.r);
     if (res) {
@@ -775,13 +778,17 @@ function leerDataLink(html) {
   return { error: '', lista };
 }
 
+function urlVidurl(base, imdb, tipo, temporada, episodio) {
+  const ruta = tipo === 'movie' ? `${imdb}/` : `${imdb}-${temporada}x${String(episodio).padStart(2, '0')}/`;
+  return `${base}/vidurl/${ruta}`;
+}
+
 async function viaVidurl(base, imdb, tipo, temporada, episodio) {
   if (!imdb) {
     trace('vidurl: sin IMDb');
     return [];
   }
-  const ruta = tipo === 'movie' ? `${imdb}/` : `${imdb}-${temporada}x${String(episodio).padStart(2, '0')}/`;
-  const html = await texto(`${base}/vidurl/${ruta}`, { headers: { Referer: `${base}/` } });
+  const html = await texto(urlVidurl(base, imdb, tipo, temporada, episodio), { headers: { Referer: `${base}/` } });
   if (!html) {
     trace(`vidurl ${dominio(base)}: sin respuesta/404`);
     return [];
@@ -819,32 +826,50 @@ function banderaAudio(a) {
   return a ? a.toUpperCase() : '';
 }
 
-function tarjeta(titulo, s) {
+function tarjeta(info, s) {
   const formato = s.type === 'hls' ? 'HLS' : 'MP4';
   const t = {
     name: FUENTE,
     title: '',
     url: s.url,
-    quality: [`\uD83D\uDCFA ${s.servidor} (${formato})${s.tag ? ` [${s.tag}]` : ''}${s.sano === false ? ' \u26A0' : ''}`, `${s.calidad || 'HD'} | WEB-DL`, banderaAudio(s.audio), `\uD83D\uDD17 ${titulo}`].filter(Boolean).join('\n'),
+    quality: [
+      `\uD83D\uDCFA ${s.servidor} (${formato})${s.sano === false ? ' \u26A0' : ''}`,
+      `${s.calidad || 'HD'} | WEB-DL`,
+      banderaAudio(s.audio),
+      `\uD83D\uDD17 ${info.etiqueta}${info.pagina ? ` \u00B7 ${info.pagina}` : ''}`
+    ].filter(Boolean).join('\n'),
     headers: s.headers || {}
   };
   if (s.type) t.type = s.type;
   return t;
 }
 
-// Diagnóstico (solo con DEBUG): revisa lista -> variante -> primer segmento y lo anota en el panel.
+// Revisa lista -> variante -> primer segmento. Marca s.sano y s.disfrazado.
+// Confirmado en pruebas: los CDN cuyos segmentos llegan como image/png (tiktokcdn) NO reproducen en Nuvio.
+// Corre siempre (no solo con DEBUG) para poder descartarlos.
 async function sondaHls(s, etiqueta) {
-  if (!DEBUG || s.type !== 'hls' || restante() < 6000) return;
+  if (s.type !== 'hls' || restante() < 6000) return;
+  const nombre = `${etiqueta}${s.tag ? ` ${s.tag}` : ''}`;
   const h = s.headers || {};
   const m = await pedir(s.url, { headers: h, limite: 6000 });
   if (!m || !m.ok) {
-    trace(`${etiqueta} lista: ${m ? `HTTP ${m.status}` : 'sin respuesta'}`);
+    s.sano = false;
+    trace(`${nombre} lista: ${m ? `HTTP ${m.status}` : 'sin respuesta'}`);
     return;
   }
   const maestro = (await conLimite(m.text(), 8000, '')) || '';
   if (!/#EXTM3U/.test(maestro)) {
-    trace(`${etiqueta} no es m3u8: ${maestro.slice(0, 40)}`);
+    s.sano = false;
+    trace(`${nombre} no es m3u8: ${maestro.slice(0, 40)}`);
     return;
+  }
+  if (!s.calidad) {
+    let alto = 0;
+    maestro.replace(/RESOLUTION=\d+x(\d+)/gi, (_, h) => {
+      alto = Math.max(alto, parseInt(h, 10));
+      return '';
+    });
+    s.calidad = etiquetaAltura(alto);
   }
   let lista = maestro;
   let urlLista = m.url || s.url;
@@ -853,7 +878,8 @@ async function sondaHls(s, etiqueta) {
     urlLista = absoluta(hijo.trim(), urlLista);
     const r2 = await pedir(urlLista, { headers: h, limite: 6000 });
     if (!r2 || !r2.ok) {
-      trace(`${etiqueta} variante: ${r2 ? `HTTP ${r2.status}` : 'sin respuesta'}`);
+      s.sano = false;
+      trace(`${nombre} variante: ${r2 ? `HTTP ${r2.status}` : 'sin respuesta'}`);
       return;
     }
     lista = (await conLimite(r2.text(), 8000, '')) || '';
@@ -866,17 +892,19 @@ async function sondaHls(s, etiqueta) {
     return '';
   });
   if (!segs.length) {
-    trace(`${etiqueta} variante sin segmentos`);
+    s.sano = false;
+    trace(`${nombre} variante sin segmentos`);
     return;
   }
   const seg = absoluta(segs[0].trim(), urlLista);
   const r3 = await pedir(seg, { headers: Object.assign({}, h, { Range: 'bytes=0-2047' }), limite: 6000 });
-  const ct = r3 && r3.headers && r3.headers.get('content-type');
-  s.sano = !!(r3 && r3.status < 400 && !/image\//i.test(String(ct || '')));
-  trace(`${etiqueta}${s.tag ? ` ${s.tag}` : ''}: ${segs.length} seg, ${Math.round(dur / 60)}min, ${/#EXT-X-ENDLIST/.test(lista) ? 'VOD' : 'sin ENDLIST'}, 1er seg ${r3 ? `HTTP ${r3.status}` : 'sin respuesta'} ${ct ? String(ct).slice(0, 25) : ''} @${dominio(seg)}${s.sano ? '' : ' \u26A0'}`);
+  const ct = String((r3 && r3.headers && r3.headers.get('content-type')) || '');
+  s.disfrazado = /image\//i.test(ct);
+  s.sano = !!(r3 && r3.status < 400 && !s.disfrazado);
+  trace(`${nombre}: ${segs.length} seg, ${Math.round(dur / 60)}min, ${/#EXT-X-ENDLIST/.test(lista) ? 'VOD' : 'sin ENDLIST'}, 1er seg ${r3 ? `HTTP ${r3.status}` : 'sin respuesta'} ${ct.slice(0, 25)} @${dominio(seg)}${s.sano ? '' : ' \u26A0'}`);
 }
 
-async function armar(lista, titulo) {
+async function armar(lista, info) {
   const resolverItem = async (item) => {
     const srv = servidorDe(item.url);
     if (!srv) return [];
@@ -901,10 +929,16 @@ async function armar(lista, titulo) {
       s.servidor = srv[0];
       s.audio = item.audio;
       if (!s.type && esHls(s.url)) s.type = 'hls';
-      if (!s.calidad) s.calidad = (await calidadHls(s.url, s.headers)) || calidadTexto(s.url);
     }
-    await Promise.all(salida.map((s) => sondaHls(s, `${srv[0]}/${item.audio || '?'}`)));
-    return salida;
+    // Se revisa de uno en uno y se para en el primer CDN sano: menos peticiones a los servidores.
+    const revisados = [];
+    for (const s of salida) {
+      await sondaHls(s, `${srv[0]}/${item.audio || '?'}`);
+      revisados.push(s);
+      if (s.sano) break;
+    }
+    for (const s of revisados) if (!s.calidad) s.calidad = calidadTexto(s.url);
+    return revisados;
   };
   const resultados = await Promise.all(lista.map(async (it) => {
     const r = await conLimite(resolverItem(it), Math.max(1000, CIERRE - 6000 - (Date.now() - inicio)), null);
@@ -918,14 +952,26 @@ async function armar(lista, titulo) {
     }
     return r;
   }));
-  const vistos = new Set();
-  const tarjetas = [];
-  for (const s of [].concat(...resultados)) {
-    if (!s.url || vistos.has(s.url)) continue;
-    vistos.add(s.url);
-    tarjetas.push({ orden: pesoAudio(s.audio) * 100000 + (s.sano === false ? 0 : 10000) + pesoCalidad(s.calidad), t: tarjeta(titulo, s) });
+  let todos = [].concat(...resultados);
+  if (todos.some((s) => !s.disfrazado)) {
+    const antes = todos.length;
+    todos = todos.filter((s) => !s.disfrazado);
+    if (todos.length < antes) trace(`descartados ${antes - todos.length} CDN con segmentos image/png`);
   }
-  return tarjetas.sort((a, b) => b.orden - a.orden).map((x) => x.t);
+  const ordenados = todos
+    .filter((s) => s.url)
+    .map((s, i) => ({ s, orden: pesoAudio(s.audio) * 100000 + (s.sano === false ? 0 : 10000) + pesoCalidad(s.calidad) - i * 0.001 }))
+    .sort((a, b) => b.orden - a.orden);
+  // Una sola opción por servidor + idioma + formato (la mejor); el resto de CDN se descarta.
+  const usados = new Set();
+  const tarjetas = [];
+  for (const x of ordenados) {
+    const clave = `${x.s.servidor}|${x.s.audio || ''}|${x.s.type || 'mp4'}`;
+    if (usados.has(clave)) continue;
+    usados.add(clave);
+    tarjetas.push(tarjeta(info, x.s));
+  }
+  return tarjetas;
 }
 
 /* ---------------------------------- entrada ---------------------------------- */
@@ -966,9 +1012,14 @@ async function getStreams(tmdbId, mediaType, season, episode) {
       } else {
         trace('sin coincidencia en la busqueda');
       }
-      if (!lista.length) lista = await viaVidurl(base, datos.imdb, tipo, temporada, episodio);
+      let mostrar = pagina || '';
+      if (!lista.length) {
+        lista = await viaVidurl(base, datos.imdb, tipo, temporada, episodio);
+        if (lista.length && !mostrar && datos.imdb) mostrar = urlVidurl(base, datos.imdb, tipo, temporada, episodio);
+      }
       if (!lista.length) continue;
-      const tarjetas = await armar(lista, titulo);
+      const info = { etiqueta: tipo === 'tv' ? `T${temporada}E${episodio}` : titulo, pagina: mostrar };
+      const tarjetas = await armar(lista, info);
       trace(`${tarjetas.length} streams`);
       if (tarjetas.length) return DEBUG ? tarjetas.concat([entradaEstado(titulo)]) : tarjetas;
     }
